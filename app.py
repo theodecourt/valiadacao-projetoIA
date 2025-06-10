@@ -163,7 +163,7 @@ with tab1:
         id_escolhidos = []
         for _, row in df.iterrows():
             id_escolhidos.append(escolhe_produtos(row["resultado_search"]))
-            time.sleep(2)  # espera entre linhas
+            time.sleep(120)  # espera entre linhas
         df["id_agente_escolhe_produtos"] = id_escolhidos
 
         df_info_products = pd.read_csv("info_products_with_brand_name.csv")
