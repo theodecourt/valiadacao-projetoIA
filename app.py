@@ -8,47 +8,51 @@ import ast
 import requests
 import concurrent.futures
 from anthropic import Anthropic
-from dotenv import load_dotenv
 
-# Carrega variáveis do .env (defina ANTHROPIC_API_KEY nas Streamlit Secrets)
-load_dotenv()
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+# Carrega variáveis de ambiente do Streamlit Secrets
+ANTHROPIC_API_KEY = st.secrets.get("ANTHROPIC_API_KEY")
+if not ANTHROPIC_API_KEY:
+    st.error("Chave ANTHROPIC_API_KEY não encontrada em st.secrets. Configure em .streamlit/secrets.toml.")
+    st.stop()
 client = Anthropic(api_key=ANTHROPIC_API_KEY)
 
+st.set_page_config(page_title="Validação de Lista com Claude", layout="wide")
 st.title("Validação de Lista com Claude e Visualização Avançada")
 
-# Parser de verificação
+# Função para parser de verificação (JSON ou string de dict)
 def parse_verificacao_text(x):
-    if isinstance(x, dict): return x
-    if not isinstance(x, str): return {}
+    if isinstance(x, dict):
+        return x
+    if not isinstance(x, str):
+        return {}
     txt = x.replace('\\n', '').strip()
     try:
         return json.loads(txt)
-    except:
+    except Exception:
         try:
             return ast.literal_eval(txt)
-        except:
+        except Exception:
             return {}
 
-# Abas
+# Cria abas
 tab1, tab2 = st.tabs(["📤 Processar CSV", "📈 Visualizar Resultados"])
 
-# ------------------ TAB 1 ------------------
+# ------------------ TAB 1: Processamento ------------------
 with tab1:
     st.header("Processar e Validar Lista")
-
-    # Exemplo de Excel
+    
+    # Botão de download do XLSX de exemplo
     try:
-        with open("validacao_teste.xlsx", "rb") as f:
+        with open("./validacao_teste.xlsx", "rb") as f:
             excel_bytes = f.read()
         st.download_button(
-            "📥 Baixar Excel de Exemplo",
-            data=excel_bytes,
-            file_name="validacao_teste.xlsx",
+            label="📥 Baixar Excel de Exemplo", 
+            data=excel_bytes, 
+            file_name="validacao_teste.xlsx", 
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
     except FileNotFoundError:
-        st.warning("Arquivo de exemplo 'validacao_teste.xlsx' não encontrado no servidor.")
+        st.warning("Arquivo de exemplo 'validacao_teste.xlsx' não encontrado. Faça upload de um arquivo válido.")
 
     uploaded_file = st.file_uploader(
         "📤 Envie o arquivo de validação (CSV ou XLSX)",
@@ -56,30 +60,30 @@ with tab1:
     )
 
     if uploaded_file:
-        # Leitura
+        # Leitura do arquivo
         if uploaded_file.name.lower().endswith(".xlsx"):
             df = pd.read_excel(uploaded_file)
         else:
             df = pd.read_csv(uploaded_file)
 
-        # Debug colunas
-        st.write("Colunas disponíveis:", df.columns.tolist())
-
-        # Atenção ao nome das colunas: corrigido de 'PROMTP_' para 'PROMPT_'
-        try:
-            PROMPT_ESCOLHE_PRODUTOS = df["PROMPT_ESCOLHE_PRODUTOS"][0]
-            PROMPT_ESTRUTURA_LISTA  = df["PROMPT_ESTRUTURA_LISTA"][0]
-            MODELO_ESCOLHE_PRODUTOS = df["MODELO_ESCOLHE_PRODUTOS"][0]
-            PROMPT_AGENTE_VERIFICACAO = df["PROMPT_AGENTE_VERIFICACAO"][0]
-        except KeyError as e:
-            st.error(f"Coluna não encontrada: {e}. Verifique os cabeçalhos do seu arquivo.")
+        # Verifica colunas necessárias
+        cols = df.columns.tolist()
+        expected = ["PROMTP_ESCOLHE_PRODUTOS","PROMPT_ESTRUTURA_LISTA","MODELO_ESCOLHE_PRODUTOS","PROMPT_AGENTE_VERIFICACAO","LISTA"]
+        missing = [c for c in expected if c not in cols]
+        if missing:
+            st.error(f"Colunas faltando: {missing}. Verifique seu arquivo.")
             st.stop()
 
-        st.success("Arquivo carregado. Iniciando processamento...")
+        PROMPT_ESCOLHE_PRODUTOS = df["PROMTP_ESCOLHE_PRODUTOS"][0]
+        PROMPT_ESTRUTURA_LISTA = df["PROMPT_ESTRUTURA_LISTA"][0]
+        MODELO_ESCOLHE_PRODUTOS = df["MODELO_ESCOLHE_PRODUTOS"][0]
+        PROMPT_AGENTE_VERIFICACAO = df["PROMPT_AGENTE_VERIFICACAO"][0]
 
-        # Normalização das listas
-        def processar_linha(texto):
-            prompt = PROMPT_ESTRUTURA_LISTA.replace("{{input}}", texto)
+        st.success("Arquivo carregado com sucesso. Iniciando o processamento...")
+
+        # Passo 1: padroniza produtos
+        def processar_linha(input_texto):
+            prompt = PROMPT_ESTRUTURA_LISTA.replace("{{input}}", input_texto)
             resp = client.messages.create(
                 model="claude-3-5-haiku-20241022",
                 max_tokens=1024,
@@ -87,13 +91,13 @@ with tab1:
             )
             try:
                 return json.loads(resp.content[0].text).get("lista", [])
-            except:
+            except Exception:
                 return []
 
         df["standardized_products"] = df["LISTA"].apply(processar_linha)
         df["unique_products"] = df["standardized_products"].apply(lambda x: list(dict.fromkeys(x)))
 
-        # Busca no BFF GraphQL
+        # Passo 2: busca GraphQL concorrente
         def search_for_product(product):
             url = 'https://api.trela.com.br/emporium-bff/graphql'
             headers = {"Content-Type": "application/json"}
@@ -103,34 +107,49 @@ with tab1:
             }}"""
             resp = requests.post(url, headers=headers, json={"query": query})
             if resp.status_code == 200:
-                nodes = resp.json().get("data",{}).get("search",{}).get("products",{}).get("nodes",[])
-                return product.lower(), [{"name":n["productName"],"id":n["productId"],"supplier":n["supplierName"]} for n in nodes]
+                nodes = resp.json().get("data", {}).get("search", {}).get("products", {}).get("nodes", [])
+                return product.lower(), [
+                    {"name": n["productName"], "id": n["productId"], "supplier": n["supplierName"]}
+                    for n in nodes
+                ]
             return product.lower(), []
 
-        df["resultado_search"] = df["unique_products"].apply(
-            lambda ups: dict(concurrent.futures.ThreadPoolExecutor(max_workers=4).map(search_for_product, ups))
-        )
+        def get_products_search_library(unique_products):
+            library = {}
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as exe:
+                futures = {exe.submit(search_for_product, p): p for p in unique_products}
+                for f in concurrent.futures.as_completed(futures):
+                    k, v = f.result()
+                    library[k] = v
+            return library
 
-        # Escolha de IDs
-        def run_flow_for_product(key, resultado):
+        df["resultado_search"] = df["unique_products"].apply(get_products_search_library)
+
+        # Passo 3: agente escolhe IDs com retries
+        def run_flow_for_product(key, resultado, retries=3):
             filled = PROMPT_ESCOLHE_PRODUTOS.replace("{key}", key)
             filled = filled.replace(
                 "{json.dumps(resultado, indent=2, ensure_ascii=False)}",
                 json.dumps(resultado, indent=2, ensure_ascii=False)
             )
-            resp = client.messages.create(
-                model=MODELO_ESCOLHE_PRODUTOS,
-                max_tokens=256,
-                messages=[{"role": "user", "content": filled}]
-            )
-            try:
-                return json.loads(resp.content[0].text.strip())
-            except:
-                return ["NOT_FOUND"]
+            for i in range(retries):
+                try:
+                    r = client.messages.create(
+                        model=MODELO_ESCOLHE_PRODUTOS,
+                        max_tokens=256,
+                        messages=[{"role": "user", "content": filled}]
+                    )
+                    return json.loads(r.content[0].text.strip())
+                except Exception:
+                    time.sleep(2 ** i)
+            return ["NOT_FOUND"]
 
-        df["id_agente_escolhe_produtos"] = df["resultado_search"].apply(lambda r: {k: run_flow_for_product(k, r) for k in r})
+        def escolhe_todos(result_search):
+            return {k: run_flow_for_product(k, result_search) for k in result_search}
 
-        # Mapeia para nomes/fornecedor
+        df["id_agente_escolhe_produtos"] = df["resultado_search"].apply(escolhe_todos)
+
+        # Passo 4: mapeia IDs para nomes e fornecedores
         df_info = pd.read_csv("info_products_with_brand_name.csv")
         def map_ids(d):
             out = {}
@@ -145,43 +164,50 @@ with tab1:
                                 "fornecedor": row.BRAND_NAME.values[0]
                             })
             return out
+
         df["nome_fornecedor_agente_escolhe_produtos"] = df["id_agente_escolhe_produtos"].apply(map_ids)
 
-        # Verificação final
+        # Passo 5: verificação final
         def run_verificacao(o):
             inp = json.dumps(o, ensure_ascii=False) if isinstance(o, dict) else o
             prompt = PROMPT_AGENTE_VERIFICACAO + "\nInput: " + inp
-            resp = client.messages.create(
-                model="claude-opus-4-20250514",
-                max_tokens=1024,
-                messages=[{"role": "user", "content": prompt}]
-            )
-            return resp.content
+            try:
+                resp = client.messages.create(
+                    model="claude-opus-4-20250514",
+                    max_tokens=1024,
+                    messages=[{"role": "user", "content": prompt}]
+                )
+                return resp.content
+            except Exception:
+                return None
 
         df["output_agente_verificacao"] = df["nome_fornecedor_agente_escolhe_produtos"].apply(run_verificacao)
 
+        # Extrai JSON da resposta
         def extrair_json(tb):
             txt = getattr(tb, "text", str(tb))
             start = txt.find('{')
             if start < 0: return None
             depth = 0
             for i, ch in enumerate(txt[start:], start):
-                if ch=='{': depth+=1
-                elif ch=='}': depth-=1
-                if depth==0: return txt[start:i+1]
+                if ch == '{': depth += 1
+                elif ch == '}': depth -= 1
+                if depth == 0: return txt[start:i+1]
             return None
 
         df["output_agente_verificacao_limpo"] = df["output_agente_verificacao"].apply(extrair_json)
 
+        # Conta sim/nao e calcula percentual
         def conta_sim_nao(o):
             if pd.isna(o): return pd.Series({'quantidade_sim':0,'quantidade_nao':0})
-            try: d = json.loads(o.replace('\\n',''))
-            except: 
+            try:
+                d = json.loads(o.replace('\\n',''))
+            except:
                 try: d = ast.literal_eval(o)
                 except: return pd.Series({'quantidade_sim':0,'quantidade_nao':0})
-            s=n=0
+            s = n = 0
             for lst in d.values():
-                if isinstance(lst,list):
+                if isinstance(lst, list):
                     for it in lst:
                         if it.get('resposta')=='sim': s+=1
                         elif it.get('resposta')=='não': n+=1
@@ -189,22 +215,22 @@ with tab1:
 
         cont = df["output_agente_verificacao_limpo"].apply(conta_sim_nao)
         df = pd.concat([df, cont], axis=1)
-        df['perc_acerto'] = df.apply(lambda r: round((r.quantidade_sim/(r.quantidade_sim+r.quantidade_nao)*100),2)
-                                     if r.quantidade_sim+r.quantidade_nao>0 else 0, axis=1)
+        df['perc_acerto'] = df.apply(
+            lambda r: round((r.quantidade_sim/(r.quantidade_sim+r.quantidade_nao)*100),2)
+            if (r.quantidade_sim+r.quantidade_nao)>0 else 0, axis=1
+        )
 
-        # resumo
+        # Gera resumo e planilha
         resumo = pd.DataFrame({
             'Métrica':['Total SIM','Total NÃO','% Acerto'],
             'Valor':[df.quantidade_sim.sum(), df.quantidade_nao.sum(), df.perc_acerto.mean()]
         })
-
-        # prepara Excel
         buf = io.BytesIO()
-        with pd.ExcelWriter(buf, engine='openpyxl') as w:
+        with pd.ExcelWriter(buf, engine='openpyxl') as writer:
             df.rename(columns={'nome_fornecedor_agente_escolhe_produtos':'produtos_fornecedores'})[
                 ['produtos_fornecedores','output_agente_verificacao_limpo','quantidade_sim','quantidade_nao','perc_acerto']
-            ].to_excel(w, sheet_name='Dados', index=False)
-            resumo.to_excel(w, sheet_name='Resumo', index=False)
+            ].to_excel(writer, sheet_name='Dados', index=False)
+            resumo.to_excel(writer, sheet_name='Resumo', index=False)
         buf.seek(0)
 
         st.subheader("✅ Resultado Final")
@@ -212,26 +238,25 @@ with tab1:
         st.download_button("📥 Baixar resultados (.xlsx)", data=buf, file_name="resultados.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-# ------------------ TAB 2 ------------------
+# ------------------ TAB 2: Visualização Avançada ------------------
 with tab2:
     st.header("Visualização Avançada de Resultados")
-    uploaded_xlsx = st.file_uploader(
-        "Envie o arquivo de resultados (.xlsx)", type=["xlsx"]
-    )
+    uploaded_xlsx = st.file_uploader("Envie o arquivo de resultados (.xlsx)", type=["xlsx"] )
     if uploaded_xlsx:
         df_vis = pd.read_excel(uploaded_xlsx, sheet_name='Dados')
-        df_vis['produtos_fornecedores'] = df_vis['produtos_fornecedores'].apply(
-            lambda x: ast.literal_eval(x) if isinstance(x,str) else x
-        )
+        if 'produtos_fornecedores' in df_vis.columns:
+            df_vis['produtos_fornecedores'] = df_vis['produtos_fornecedores'].apply(
+                lambda x: ast.literal_eval(x) if isinstance(x, str) else x
+            )
         ver_cols = [c for c in df_vis.columns if 'verificacao' in c.lower()]
         if not ver_cols:
             st.error("Coluna de verificação não encontrada.")
             st.stop()
         df_vis['verificacao'] = df_vis[ver_cols[0]].apply(parse_verificacao_text)
 
-        total_s=total_n=0
+        total_s = total_n = 0
         for d in df_vis['verificacao']:
-            if isinstance(d,dict):
+            if isinstance(d, dict):
                 for lst in d.values():
                     for it in lst:
                         if it.get('resposta')=='sim': total_s+=1
@@ -245,5 +270,16 @@ with tab2:
         st.markdown("---")
         st.subheader("🔍 Detalhamento por Item")
         for _, row in df_vis.iterrows():
-            st.markdown(f"**Item pedido:** {row.produtos_fornecedores}")
-            st.write("")
+            for item, prods in (row['produtos_fornecedores'] or {}).items():
+                st.markdown(f"**Item pedido:** {item}")
+                vr = row['verificacao'].get(item, [])
+                for idx, prod in enumerate(prods):
+                    nome = prod['produto']
+                    status = vr[idx].get('resposta') if idx < len(vr) else None
+                    exp = vr[idx].get('explicacao','') if idx < len(vr) else ''
+                    icon = '✅' if status=='sim' else '❌'
+                    line = f"- {nome} {icon}"
+                    if exp:
+                        line += f"  - Explicação: {exp}"
+                    st.markdown(line)
+                st.write("")
