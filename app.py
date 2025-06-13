@@ -11,13 +11,13 @@ from anthropic import Anthropic
 from anthropic._exceptions import OverloadedError
 from dotenv import load_dotenv
 
+# Configuração da página
+st.set_page_config(page_title="Validação de Lista com Claude e Visualização Avançada", layout="wide")
+
 # Carrega variáveis do .env
-load_dotenv()
+dotenv_loaded = load_dotenv()
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 client = Anthropic(api_key=ANTHROPIC_API_KEY)
-
-st.set_page_config(page_title="Validação de Lista com Claude e Visualização Avançada", layout="wide")
-st.title("Validação de Lista com Claude e Visualização Avançada")
 
 # Função para parser de verificação (JSON ou string de dict)
 def parse_verificacao_text(x):
@@ -35,17 +35,16 @@ def parse_verificacao_text(x):
         except Exception:
             return {}
 
-# Cria abas: Processamento e Visualização
+# Abas do Streamlit
 tab1, tab2 = st.tabs(["📤 Processar CSV", "📈 Visualizar Resultados"])
 
 # ------------------ TAB 1: Processamento ------------------
 with tab1:
     st.header("📤 Processar CSV: Validação de Lista com Claude")
 
-    # Botão de download do XLSX de exemplo
+    # Download do Excel de exemplo
     with open("validacao_teste.xlsx", "rb") as f:
         excel_bytes = f.read()
-
     st.download_button(
         label="📥 Baixar Excel de Exemplo",
         data=excel_bytes,
@@ -73,32 +72,31 @@ with tab1:
 
         st.success("Arquivo carregado com sucesso. Iniciando o processamento...")
         progress_bar = st.progress(0)
+        total_rows = len(df)
 
         # Função de normalização com retry em caso de OverloadedError
 def processar_linha(input_texto, retries=3):
     prompt = PROMPT_ESTRUTURA_LISTA.replace("{{input}}", input_texto)
     for attempt in range(retries):
         try:
-            resposta = client.messages.create(
+            response = client.messages.create(
                 model="claude-3-5-haiku-20241022",
                 max_tokens=1024,
                 messages=[{"role": "user", "content": prompt}]
             )
-            return json.loads(resposta.content[0].text).get("lista", [])
+            return json.loads(response.content[0].text).get("lista", [])
         except OverloadedError:
-            wait = 2 ** attempt
-            time.sleep(wait)
+            time.sleep(2 ** attempt)
         except Exception:
-            return []
+            break
     return []
 
-        # Aplica normalização com barra de progresso
+        # Aplica a normalização linha a linha
         standardized = []
-        total = len(df)
         for idx, texto in enumerate(df["LISTA"]):
             standardized.append(processar_linha(texto))
-            progress_bar.progress((idx + 1) / total)
-            time.sleep(0.5)  # evita hits muito rápidos
+            progress_bar.progress((idx + 1) / total_rows)
+            time.sleep(0.5)  # evita requisições muito rápidas
         df["standardized_products"] = standardized
         df["unique_products"] = df["standardized_products"].apply(lambda prods: list(dict.fromkeys(prods)))
 
@@ -106,52 +104,40 @@ def processar_linha(input_texto, retries=3):
 def search_for_product(product):
     url = 'https://api.trela.com.br/emporium-bff/graphql'
     headers = {"Content-Type": "application/json"}
-    graphql_query = f"""
+    query = f"""
     query searchProducts {{
         search(query: \"{product}\", hubId: 1) {{
-            products {{
-                nodes {{
-                    productId
-                    productName
-                    supplierName
-                }}
-            }}
+            products {{ nodes {{ productId productName supplierName }} }}
         }}
     }}
     """
-    resp = requests.post(url, headers=headers, json={"query": graphql_query})
+    resp = requests.post(url, headers=headers, json={"query": query})
     if resp.status_code == 200:
         nodes = resp.json().get("data", {}).get("search", {}).get("products", {}).get("nodes", [])
-        return (product.lower(), [
-            {"name": n.get("productName"), "id": n.get("productId"), "supplier": n.get("supplierName")}
-            for n in nodes
-        ])
+        return (product.lower(), [{"name": n["productName"], "id": n["productId"], "supplier": n["supplierName"]} for n in nodes])
     return (product.lower(), [])
 
-        # Construção da biblioteca de busca em paralelo
+        # Constrói biblioteca em paralelo
 def get_products_search_library(unique_products):
-    library = {}
+    lib = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-        futures = [executor.submit(search_for_product, p) for p in unique_products]
+        futures = {executor.submit(search_for_product, p): p for p in unique_products}
         for fut in concurrent.futures.as_completed(futures):
-            key, nodes = fut.result()
-            library[key] = nodes
-    return library
+            key, items = fut.result()
+            lib[key] = items
+    return lib
 
         df["resultado_search"] = df["unique_products"].apply(get_products_search_library)
 
         # Fluxo de escolha de IDs com retry
-def run_flow_for_product(key, resultado_search, retries=3):
-    prompt = PROMPT_ESCOLHE_PRODUTOS.replace("{key}", key)
-    prompt = prompt.replace(
-        "{json.dumps(resultado_search, indent=2, ensure_ascii=False)}",
-        json.dumps(resultado_search, indent=2, ensure_ascii=False)
-    )
+def run_flow_for_product(key, resultado, retries=3):
+    filled = PROMPT_ESCOLHE_PRODUTOS.replace("{key}", key)
+    filled = filled.replace("{json.dumps(resultado, indent=2, ensure_ascii=False)}", json.dumps(resultado, indent=2, ensure_ascii=False))
     for attempt in range(retries):
         try:
             resp = client.messages.create(
                 model=MODELO_ESCOLHE_PRODUTOS,
-                messages=[{"role": "user", "content": prompt}],
+                messages=[{"role": "user", "content": filled}],
                 max_tokens=256
             )
             return json.loads(resp.content[0].text.strip())
@@ -161,39 +147,37 @@ def run_flow_for_product(key, resultado_search, retries=3):
             break
     return ["NOT_FOUND"]
 
-        def escolhe_produtos(resultado_search: dict):
-    output = {}
-    for key, res in resultado_search.items():
-        output[key] = run_flow_for_product(key, res)
+        def escolhe_produtos(resultado):
+    out = {}
+    for k, res in resultado.items():
+        out[k] = run_flow_for_product(k, res)
         time.sleep(1)
-    return output
+    return out
 
         # Aplica escolha de produtos
-        id_escolhidos = []
+        ids = []
         for res in df["resultado_search"]:
-            id_escolhidos.append(escolhe_produtos(res))
+            ids.append(escolhe_produtos(res))
             time.sleep(2)
-        df["id_agente_escolhe_produtos"] = id_escolhidos
+        df["id_agente_escolhe_produtos"] = ids
 
         # Mapeia IDs para nomes e fornecedores
-df_info_products = pd.read_csv("info_products_with_brand_name.csv")
+df_info = pd.read_csv("info_products_with_brand_name.csv")
 
-def map_ids_to_prod_fornecedor(id_dict):
+def map_ids(id_dict):
     result = {}
-    for key, id_list in id_dict.items():
-        if not isinstance(id_list, list) or not all(isinstance(x, int) for x in id_list):
-            result[key] = []
+    for k, lst in id_dict.items():
+        if not isinstance(lst, list):
+            result[k] = []
             continue
-        subset = df_info_products[df_info_products['PRODUCT_ID'].isin(id_list)]
-        result[key] = [
-            {"produto": r['PRODUCT_NAME'], "fornecedor": r['BRAND_NAME']} for _, r in subset.iterrows()
-        ]
+        subset = df_info[df_info['PRODUCT_ID'].isin(lst)]
+        result[k] = [{"produto": r['PRODUCT_NAME'], "fornecedor": r['BRAND_NAME']} for _, r in subset.iterrows()]
     return result
 
-        df["nome_fornecedor_agente_escolhe_produtos"] = df["id_agente_escolhe_produtos"].apply(map_ids_to_prod_fornecedor)
+        df["nome_fornecedor_agente_escolhe_produtos"] = df["id_agente_escolhe_produtos"].apply(map_ids)
 
         # Função de verificação final
-        def run_verificacao(input_obj):
+def run_verificacao(input_obj):
     input_json = json.dumps(input_obj, ensure_ascii=False) if isinstance(input_obj, dict) else input_obj
     prompt = f"{PROMPT_AGENTE_VERIFICACAO}\nInput: {input_json}"
     for attempt in range(3):
@@ -230,41 +214,32 @@ def extrair_json(textblock):
 
         # Conta respostas sim/não
 def conta_sim_nao(obj):
-    if pd.isna(obj):
-        return pd.Series({'quantidade_sim': 0, 'quantidade_nao': 0})
+    if pd.isna(obj): return pd.Series({'quantidade_sim': 0, 'quantidade_nao': 0})
     try:
-        d = json.loads(obj.replace('\\n', '')) if isinstance(obj, str) else obj
-    except Exception:
+        d = json.loads(obj.replace('\\n','')) if isinstance(obj, str) else obj
+    except:
         try:
-            d = ast.literal_eval(obj.strip())
-        except Exception:
+            d = ast.literal_eval(obj)
+        except:
             return pd.Series({'quantidade_sim': 0, 'quantidade_nao': 0})
-    n_sim = n_nao = 0
+    sim = nao = 0
     for listas in d.values():
         if isinstance(listas, list):
             for item in listas:
-                resp = item.get('resposta')
-                if resp == 'sim': n_sim += 1
-                elif resp == 'não': n_nao += 1
-    return pd.Series({'quantidade_sim': n_sim, 'quantidade_nao': n_nao})
+                if item.get('resposta') == 'sim': sim += 1
+                elif item.get('resposta') == 'não': nao += 1
+    return pd.Series({'quantidade_sim': sim, 'quantidade_nao': nao})
 
-        contagens = df["output_agente_verificacao_limpo"].apply(conta_sim_nao)
-        df = pd.concat([df, contagens], axis=1)
-        df['perc_acerto'] = df.apply(
-            lambda r: round((r['quantidade_sim'] / (r['quantidade_sim'] + r['quantidade_nao']) * 100), 2)
-            if (r['quantidade_sim'] + r['quantidade_nao']) > 0 else 0,
-            axis=1
-        )
+        cont = df["output_agente_verificacao_limpo"].apply(conta_sim_nao)
+        df = pd.concat([df, cont], axis=1)
+        df['perc_acerto'] = df.apply(lambda r: round((r['quantidade_sim'] / (r['quantidade_sim'] + r['quantidade_nao']) * 100), 2) if (r['quantidade_sim'] + r['quantidade_nao']) > 0 else 0, axis=1)
 
         # Cria planilha de resultados
         resumo_df = pd.DataFrame({
             'Métrica': ['Total de SIM', 'Total de NÃO', 'Percentual geral de acerto (%)'],
-            'Valor': [df['quantidade_sim'].sum(), df['quantidade_nao'].sum(), round((df['quantidade_sim'].sum() / (df['quantidade_sim'].sum() + df['quantidade_nao'].sum())) * 100, 2)]
+            'Valor': [df['quantidade_sim'].sum(), df['quantidade_nao'].sum(), round((df['quantidade_sim'].sum() / (df['quantidade_sim'].sum()+df['quantidade_nao'].sum())*100),2)]
         })
-
-        df_excel = df.rename(columns={'nome_fornecedor_agente_escolhe_produtos': 'produtos_fornecedores'})[
-            ['produtos_fornecedores', 'output_agente_verificacao_limpo', 'quantidade_sim', 'quantidade_nao', 'perc_acerto']
-        ]
+        df_excel = df.rename(columns={'nome_fornecedor_agente_escolhe_produtos': 'produtos_fornecedores'})[['produtos_fornecedores', 'output_agente_verificacao_limpo', 'quantidade_sim', 'quantidade_nao', 'perc_acerto']]
 
         # Download dos resultados
         output = io.BytesIO()
@@ -272,45 +247,36 @@ def conta_sim_nao(obj):
             df_excel.to_excel(writer, sheet_name='Dados', index=False)
             resumo_df.to_excel(writer, sheet_name='Resumo', index=False)
         output.seek(0)
-
         st.subheader("✅ Resultado Final")
         st.dataframe(df_excel)
-        st.download_button("📥 Baixar planilha de resultados (.xlsx)", data=output, file_name="resultados.xlsx")
+        st.download_button("📥 Baixar planilha de resultados", data=output, file_name="resultados.xlsx")
 
 # ------------------ TAB 2: Visualização ------------------
 with tab2:
     st.header("📈 Visualização Avançada de Resultados")
-    uploaded_xlsx = st.file_uploader(
-        "Envie o arquivo de resultados (.xlsx)", type=["xlsx"]
-    )
+    uploaded_xlsx = st.file_uploader("Envie o arquivo de resultados (.xlsx)", type=["xlsx"])
     if uploaded_xlsx:
         df_vis = pd.read_excel(uploaded_xlsx, sheet_name='Dados')
         if 'produtos_fornecedores' in df_vis.columns:
-            df_vis['produtos_fornecedores'] = df_vis['produtos_fornecedores'].apply(
-                lambda x: ast.literal_eval(x) if isinstance(x, str) else x
-            )
+            df_vis['produtos_fornecedores'] = df_vis['produtos_fornecedores'].apply(lambda x: ast.literal_eval(x) if isinstance(x, str) else x)
         ver_cols = [c for c in df_vis.columns if 'verificacao' in c.lower()]
         if ver_cols:
             df_vis['verificacao'] = df_vis[ver_cols[0]].apply(parse_verificacao_text)
         else:
             st.error("Coluna de verificação não encontrada.")
-
         total_sim = total_nao = 0
         for d in df_vis['verificacao']:
             if isinstance(d, dict):
-                for resp_list in d.values():
-                    for r in resp_list:
+                for lst in d.values():
+                    for r in lst:
                         if r.get('resposta') == 'sim': total_sim += 1
                         elif r.get('resposta') == 'não': total_nao += 1
         perc = round((total_sim / (total_sim + total_nao) * 100), 2) if (total_sim + total_nao) > 0 else 0
-
-        st.subheader("📊 Resumo de Resultados")
         c1, c2, c3 = st.columns(3)
         c1.metric("Total de SIM", total_sim)
         c2.metric("Total de NÃO", total_nao)
         c3.metric("% de Acerto", f"{perc}%")
         st.markdown("---")
-
         st.subheader("🔍 Detalhamento por Item")
         for _, row in df_vis.iterrows():
             pf = row['produtos_fornecedores'] or {}
