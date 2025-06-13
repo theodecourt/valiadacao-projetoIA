@@ -234,8 +234,17 @@ with tab1:
         buf.seek(0)
 
         st.subheader("✅ Resultado Final")
-        st.dataframe(df[['produtos_fornecedores','output_agente_verificacao_limpo','quantidade_sim','quantidade_nao','perc_acerto']])
-        st.download_button("📥 Baixar resultados (.xlsx)", data=buf, file_name="resultados.xlsx",
+        # Renomeia coluna para exibição correta
+        df = df.rename(columns={'nome_fornecedor_agente_escolhe_produtos': 'produtos_fornecedores'})
+        st.dataframe(df[[
+            'produtos_fornecedores',
+            'output_agente_verificacao_limpo',
+            'quantidade_sim',
+            'quantidade_nao',
+            'perc_acerto'
+        ]])
+        st.download_button("📥 Baixar resultados (.xlsx)", data=buf, file_name="resultados.xlsx",  
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")("📥 Baixar resultados (.xlsx)", data=buf, file_name="resultados.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 # ------------------ TAB 2: Visualização Avançada ------------------
