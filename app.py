@@ -21,7 +21,7 @@ st.title("Validação de Lista com Claude e Visualização Avançada")
 
 # Função para parser de verificação (JSON ou string de dict)
 def parse_verificacao_text(x):
-    if isinstance(x, dict):
+    if isinstance(x, dict): 
         return x
     if not isinstance(x, str):
         return {}
@@ -84,17 +84,46 @@ with tab1:
         # Passo 1: padroniza produtos
         def processar_linha(input_texto):
             prompt = PROMPT_ESTRUTURA_LISTA.replace("{{input}}", input_texto)
-            resp = client.messages.create(
-                model="claude-3-5-haiku-20241022",
-                max_tokens=1024,
-                messages=[{"role": "user", "content": prompt}]
-            )
-            try:
-                return json.loads(resp.content[0].text).get("lista", [])
-            except Exception:
-                return []
+            max_retries = 3
+            base_delay = 2  # seconds
+            
+            for attempt in range(max_retries):
+                try:
+                    # Add a small delay between attempts to avoid rate limiting
+                    if attempt > 0:
+                        time.sleep(base_delay * (2 ** attempt))
+                        
+                    resp = client.messages.create(
+                        model="claude-3-5-haiku-20241022",
+                        max_tokens=1024,
+                        messages=[{"role": "user", "content": prompt}]
+                    )
+                    try:
+                        return json.loads(resp.content[0].text).get("lista", [])
+                    except Exception as e:
+                        st.warning(f"Erro ao processar resposta JSON: {str(e)}")
+                        return []
+                        
+                except Exception as e:
+                    if attempt == max_retries - 1:  # Last attempt
+                        st.error(f"Erro após {max_retries} tentativas: {str(e)}")
+                        return []
+                    continue
+            
+            return []
 
-        df["standardized_products"] = df["LISTA"].apply(processar_linha)
+        # Add rate limiting for the entire DataFrame processing
+        def process_dataframe_with_rate_limit(df):
+            results = []
+            for idx, row in df.iterrows():
+                result = processar_linha(row["LISTA"])
+                results.append(result)
+                # Add a small delay between rows to avoid rate limiting
+                time.sleep(0.5)
+            return results
+
+        # Replace the direct apply with our rate-limited version
+        df["standardized_products"] = process_dataframe_with_rate_limit(df)
         df["unique_products"] = df["standardized_products"].apply(lambda x: list(dict.fromkeys(x)))
 
         # Passo 2: busca GraphQL concorrente
@@ -244,7 +273,6 @@ with tab1:
             'perc_acerto'
         ]])
         st.download_button("📥 Baixar resultados (.xlsx)", data=buf, file_name="resultados.xlsx",  
-                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")("📥 Baixar resultados (.xlsx)", data=buf, file_name="resultados.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 # ------------------ TAB 2: Visualização Avançada ------------------
